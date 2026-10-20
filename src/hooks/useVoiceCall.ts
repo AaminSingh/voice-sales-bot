@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
+import { AudioEngine, RecordedAudioResult } from "@/lib/audioEngine";
+import { uploadRecording } from "@/lib/uploadRecording";
 
 // Tunable delay (in milliseconds) of silence before treating customer speech as a completed turn
 export const END_OF_TURN_SILENCE_MS = 1800;
@@ -21,11 +23,26 @@ export type CallStatus =
   | "ended"
   | "error";
 
+export type RecordingStatus =
+  | "idle"
+  | "recording"
+  | "uploading"
+  | "uploaded"
+  | "failed";
+
 export interface CallMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   timestamp: string;
+}
+
+export interface CallRecording {
+  blob: Blob;
+  localUrl: string;
+  mimeType: string;
+  durationMs: number;
+  fileName: string;
 }
 
 function getCurrentTimestamp(): string {
@@ -67,7 +84,16 @@ export function useVoiceCall() {
   const [voiceWarning, setVoiceWarning] = useState<string | null>(null);
   const [durationSeconds, setDurationSeconds] = useState(0);
 
-  // Lazy initializer to avoid setting state synchronously inside an effect
+  // Phase 5 state: Consent, Audio Recording & Playback
+  const [consentGiven, setConsentGiven] = useState(false);
+  const [consentTimestamp, setConsentTimestamp] = useState<string | null>(null);
+  const [recording, setRecording] = useState<CallRecording | null>(null);
+  const [recordingStatus, setRecordingStatus] = useState<RecordingStatus>("idle");
+  const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
+  const [recordingError, setRecordingError] = useState<string | null>(null);
+  const [ttsFallbackUsed, setTtsFallbackUsed] = useState(false);
+
+  // Lazy initializer to verify browser support
   const [isSupported] = useState<boolean>(() => {
     if (typeof window === "undefined") return true;
     const hasSpeechRec =
@@ -86,11 +112,17 @@ export function useVoiceCall() {
   const isRecognizingRef = useRef(false);
   const isHandlingTurnRef = useRef(false);
 
+  // AudioEngine & Recording refs
+  const audioEngineRef = useRef<AudioEngine | null>(null);
+  const localRecordingUrlRef = useRef<string | null>(null);
+  const latestRecordingBlobRef = useRef<{ blob: Blob; mimeType: string } | null>(null);
+  const currentTtsControllerRef = useRef<AbortController | null>(null);
+
   // Timer refs
   const callStartTimeRef = useRef<number | null>(null);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Audio / Speech refs
+  // Web Speech refs
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const turnBufferRef = useRef("");
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -149,7 +181,7 @@ export function useVoiceCall() {
     }, 1000);
   }, [stopTimer]);
 
-  // Check Hindi voice availability
+  // Check Hindi voice availability for speechSynthesis fallback
   const checkVoices = useCallback((voices: SpeechSynthesisVoice[]) => {
     voicesRef.current = voices;
     if (typeof window === "undefined") return;
@@ -168,7 +200,7 @@ export function useVoiceCall() {
     }
   }, []);
 
-  // Find the most suitable voice for speech synthesis
+  // Find the most suitable voice for speech synthesis fallback
   const getPreferredVoice = useCallback((): SpeechSynthesisVoice | null => {
     const voices = voicesRef.current;
     if (!voices || voices.length === 0) return null;
@@ -217,45 +249,6 @@ export function useVoiceCall() {
     }
   }, []);
 
-  // End Call handler (declared early so other callbacks can safely invoke it)
-  const endCall = useCallback(() => {
-    console.log("[voice] Ending voice call");
-    isCallActiveRef.current = false;
-    isSpeakingRef.current = false;
-    isHandlingTurnRef.current = false;
-
-    // Stop timer and retain final duration
-    stopTimer();
-
-    // Abort in-flight network requests
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-
-    // Clear timers
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    if (restartTimerRef.current) {
-      clearTimeout(restartTimerRef.current);
-      restartTimerRef.current = null;
-    }
-
-    // Stop speech synthesis & empty sentence queue
-    utteranceQueueRef.current = [];
-    if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
-
-    // Stop speech recognition
-    stopRecognition();
-
-    updateStatus("ended");
-    setInterimText("");
-  }, [stopRecognition, stopTimer, updateStatus]);
-
   // Start speech recognition with state guards
   const startRecognition = useCallback(() => {
     if (!recognitionRef.current || !isCallActiveRef.current) return;
@@ -272,7 +265,6 @@ export function useVoiceCall() {
       isRecognizingRef.current = true;
       console.log("[voice] SpeechRecognition started");
     } catch (err: unknown) {
-      // Ignore InvalidStateError if already starting
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes("already started")) {
         console.warn("[voice] Recognition start warning:", err);
@@ -280,9 +272,126 @@ export function useVoiceCall() {
     }
   }, []);
 
+  // End Call handler
+  const endCall = useCallback(() => {
+    console.log("[voice] Ending voice call");
+    isCallActiveRef.current = false;
+    isSpeakingRef.current = false;
+    isHandlingTurnRef.current = false;
+
+    // Stop timer and retain final duration
+    stopTimer();
+
+    // Abort in-flight network requests
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    if (currentTtsControllerRef.current) {
+      currentTtsControllerRef.current.abort();
+      currentTtsControllerRef.current = null;
+    }
+
+    // Clear timers
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+
+    // Stop bot audio in AudioEngine
+    if (audioEngineRef.current) {
+      audioEngineRef.current.stopBotAudio();
+    }
+
+    // Stop browser speechSynthesis & empty sentence queue
+    utteranceQueueRef.current = [];
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+
+    // Stop speech recognition
+    stopRecognition();
+
+    updateStatus("ended");
+    setInterimText("");
+
+    // Stop MediaRecorder, capture blob, and initiate Supabase upload
+    if (audioEngineRef.current) {
+      const engine = audioEngineRef.current;
+      engine
+        .stopRecording()
+        .then(async (result: RecordedAudioResult) => {
+          const { blob, mimeType, durationMs } = result;
+
+          // Dispose engine to release mic hardware immediately
+          engine.dispose();
+          audioEngineRef.current = null;
+
+          // Check for very short call (< 2 seconds or empty blob)
+          if (!blob || blob.size === 0 || durationMs < 2000) {
+            console.log("[voice] Call too short to save recording (< 2s)");
+            setRecording(null);
+            setRecordingStatus("idle");
+            setRecordingError("Recording too short to save.");
+            return;
+          }
+
+          // Revoke previous local URL if exists
+          if (localRecordingUrlRef.current) {
+            URL.revokeObjectURL(localRecordingUrlRef.current);
+          }
+
+          const localUrl = URL.createObjectURL(blob);
+          localRecordingUrlRef.current = localUrl;
+          latestRecordingBlobRef.current = { blob, mimeType };
+
+          const ext = mimeType.includes("mp4") ? "mp4" : "webm";
+          const fileName = `call-recording-${Date.now()}.${ext}`;
+
+          setRecording({ blob, localUrl, mimeType, durationMs, fileName });
+          setRecordingStatus("uploading");
+          setRecordingError(null);
+
+          try {
+            const publicUrl = await uploadRecording(blob, mimeType);
+            setRecordingUrl(publicUrl);
+            setRecordingStatus("uploaded");
+            console.log("[voice] Recording uploaded successfully:", publicUrl);
+          } catch (uploadErr: unknown) {
+            console.error("[voice] Recording upload error:", uploadErr);
+            const msg =
+              uploadErr instanceof Error
+                ? uploadErr.message
+                : "Failed to upload recording to cloud storage";
+            setRecordingStatus("failed");
+            setRecordingError(msg);
+          }
+        })
+        .catch((err) => {
+          console.error("[voice] Error stopping recording:", err);
+          engine.dispose();
+          audioEngineRef.current = null;
+        });
+    }
+  }, [stopRecognition, stopTimer, updateStatus]);
+
   // Interrupt current bot speech and resume listening
   const interrupt = useCallback(() => {
-    console.log("[voice] Interrupting speech");
+    console.log("[voice] Interrupting bot speech");
+
+    if (currentTtsControllerRef.current) {
+      currentTtsControllerRef.current.abort();
+      currentTtsControllerRef.current = null;
+    }
+
+    if (audioEngineRef.current) {
+      audioEngineRef.current.stopBotAudio();
+    }
+
     utteranceQueueRef.current = [];
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
       window.speechSynthesis.cancel();
@@ -295,8 +404,8 @@ export function useVoiceCall() {
     }
   }, [startRecognition, updateStatus]);
 
-  // Sequential sentence-by-sentence TTS playback to avoid Chrome queue cutoffs
-  const speakText = useCallback(
+  // Fallback: browser SpeechSynthesis playback (sentence-by-sentence)
+  const speakWithSpeechSynthesisFallback = useCallback(
     (fullText: string) => {
       if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
       if (!isCallActiveRef.current) return;
@@ -314,7 +423,6 @@ export function useVoiceCall() {
       isSpeakingRef.current = true;
       updateStatus("speaking");
 
-      // While bot is speaking, recognition must stop unless headphones mode is enabled
       if (!headphonesModeRef.current) {
         stopRecognition();
       }
@@ -329,7 +437,6 @@ export function useVoiceCall() {
 
         const nextSentence = utteranceQueueRef.current.shift();
         if (!nextSentence) {
-          // All sentences finished: transition to listening
           isSpeakingRef.current = false;
           if (isCallActiveRef.current) {
             updateStatus("listening");
@@ -351,7 +458,6 @@ export function useVoiceCall() {
         };
 
         utterance.onerror = (e) => {
-          // Ignore cancellation caused by interrupt() or endCall()
           if (e.error === "interrupted" || e.error === "canceled") {
             return;
           }
@@ -370,6 +476,107 @@ export function useVoiceCall() {
       playNext();
     },
     [getPreferredVoice, startRecognition, stopRecognition, updateStatus]
+  );
+
+  // Primary speech playback using /api/tts + AudioEngine with 8s timeout and fallback
+  const speakText = useCallback(
+    async (fullText: string) => {
+      if (!isCallActiveRef.current) return;
+
+      const trimmed = fullText.trim();
+      if (!trimmed) {
+        if (isCallActiveRef.current) {
+          updateStatus("listening");
+          startRecognition();
+        }
+        return;
+      }
+
+      isSpeakingRef.current = true;
+      updateStatus("speaking");
+
+      if (!headphonesModeRef.current) {
+        stopRecognition();
+      }
+
+      // Try /api/tts with 8-second timeout
+      const controller = new AbortController();
+      currentTtsControllerRef.current = controller;
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+      }, 8000);
+
+      try {
+        const res = await fetch("/api/tts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: trimmed.slice(0, 590),
+            language: languageRef.current,
+          }),
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(
+            errData.error || `TTS API returned status ${res.status}`
+          );
+        }
+
+        const wavBytes = await res.arrayBuffer();
+
+        if (!isCallActiveRef.current) {
+          isSpeakingRef.current = false;
+          return;
+        }
+
+        if (audioEngineRef.current) {
+          await audioEngineRef.current.playBotAudio(wavBytes);
+        }
+
+        currentTtsControllerRef.current = null;
+
+        if (isCallActiveRef.current) {
+          isSpeakingRef.current = false;
+          updateStatus("listening");
+          startRecognition();
+        }
+      } catch (err: unknown) {
+        clearTimeout(timeoutId);
+        currentTtsControllerRef.current = null;
+
+        if (!isCallActiveRef.current) {
+          isSpeakingRef.current = false;
+          return;
+        }
+
+        const isAbort =
+          err instanceof DOMException && err.name === "AbortError";
+        if (isAbort && !isCallActiveRef.current) {
+          return;
+        }
+
+        console.warn(
+          "[voice] /api/tts failed or timed out. Falling back to browser speechSynthesis:",
+          err
+        );
+
+        // Mark fallback used so notice is shown
+        setTtsFallbackUsed(true);
+
+        // Use browser SpeechSynthesis fallback
+        speakWithSpeechSynthesisFallback(trimmed);
+      }
+    },
+    [
+      speakWithSpeechSynthesisFallback,
+      startRecognition,
+      stopRecognition,
+      updateStatus,
+    ]
   );
 
   // Send completed customer turn to LLM
@@ -399,15 +606,12 @@ export function useVoiceCall() {
         timestamp: getCurrentTimestamp(),
       };
 
-      // Keep previous clean history for safe rollback on failure
       const previousHistory = [...messagesRef.current];
       const optimisticHistory = [...previousHistory, userMsg];
 
-      // Optimistically display the customer message in the UI
       setMessages(optimisticHistory);
       updateStatus("thinking");
 
-      // Abort previous in-flight requests if any
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
       }
@@ -454,12 +658,10 @@ export function useVoiceCall() {
           timestamp: getCurrentTimestamp(),
         };
 
-        // Commit both user message and assistant reply to official history
         const confirmedHistory = [...previousHistory, userMsg, assistantMsg];
         messagesRef.current = confirmedHistory;
         setMessages(confirmedHistory);
 
-        // Clear any previous error banner on successful reply
         setError(null);
         isHandlingTurnRef.current = false;
 
@@ -480,17 +682,12 @@ export function useVoiceCall() {
             ? err.message
             : "Connection error with AI service.";
 
-        // Stop timer on critical error
         stopTimer();
 
-        // Roll back messages so the failed customer message does not remain or duplicate
         messagesRef.current = previousHistory;
         setMessages(previousHistory);
-
-        // Show real error text in the error banner
         setError(errMsg);
 
-        // Speak fallback line once per failure (does not loop)
         const fallbackText =
           languageRef.current === "hi"
             ? "माफ़ कीजिये, कनेक्शन में समस्या आई। क्या आप दोबारा कह सकते हैं?"
@@ -559,7 +756,7 @@ export function useVoiceCall() {
 
       setInterimText(fullLive);
 
-      // Voice interruption trigger in headphones mode while bot is speaking
+      // Voice interruption trigger in headphones mode
       if (
         isSpeakingRef.current &&
         headphonesModeRef.current &&
@@ -597,8 +794,6 @@ export function useVoiceCall() {
     recognition.onend = () => {
       isRecognizingRef.current = false;
 
-      // Chrome stops recognition after silence periods even in continuous mode.
-      // Automatically restart if call is active and bot is not busy.
       if (isCallActiveRef.current) {
         const canRestart =
           (!isSpeakingRef.current || headphonesModeRef.current) &&
@@ -635,7 +830,6 @@ export function useVoiceCall() {
       } else if (event.error === "audio-capture") {
         setError("No microphone found.");
       }
-      // "no-speech" and "aborted" are intentionally ignored and recover automatically
     };
 
     recognitionRef.current = recognition;
@@ -650,7 +844,7 @@ export function useVoiceCall() {
     };
   }, [endCall, handleUserTurn, interrupt, startRecognition]);
 
-  // Start Call handler (triggered directly by user gesture click)
+  // Start Call handler (triggered directly after consent is granted)
   const startCall = useCallback(async () => {
     if (typeof window === "undefined") return;
 
@@ -671,6 +865,40 @@ export function useVoiceCall() {
       // ignore
     }
 
+    // Record consent timestamp
+    setConsentGiven(true);
+    setConsentTimestamp(new Date().toISOString());
+
+    // Revoke previous recording URL
+    if (localRecordingUrlRef.current) {
+      URL.revokeObjectURL(localRecordingUrlRef.current);
+      localRecordingUrlRef.current = null;
+    }
+    setRecording(null);
+    setRecordingStatus("idle");
+    setRecordingUrl(null);
+    setRecordingError(null);
+    setTtsFallbackUsed(false);
+
+    // Initialize AudioEngine (captures mic and resumes AudioContext inside user gesture)
+    try {
+      if (audioEngineRef.current) {
+        audioEngineRef.current.dispose();
+      }
+      const engine = new AudioEngine();
+      await engine.init();
+      audioEngineRef.current = engine;
+    } catch (micErr: unknown) {
+      console.error("[voice] Microphone initialization error:", micErr);
+      const msg =
+        micErr instanceof Error
+          ? micErr.message
+          : "Microphone permission denied. Please allow microphone access and try again.";
+      setError(msg);
+      updateStatus("error");
+      return;
+    }
+
     console.log("[voice] Starting voice call...");
     isCallActiveRef.current = true;
     isSpeakingRef.current = false;
@@ -685,7 +913,6 @@ export function useVoiceCall() {
     stopTimer();
     updateStatus("connecting");
 
-    // Abort previous controller if any
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
@@ -729,6 +956,12 @@ export function useVoiceCall() {
       // Timer starts when the call becomes "live" (greeting begins speaking)
       startTimer();
 
+      // Start MediaRecorder right when greeting starts
+      if (audioEngineRef.current) {
+        audioEngineRef.current.startRecording();
+        setRecordingStatus("recording");
+      }
+
       // Speak opening greeting (onend will transition to listening)
       speakText(greeting);
     } catch (err: unknown) {
@@ -746,8 +979,46 @@ export function useVoiceCall() {
       stopTimer();
       setError(errMsg);
       updateStatus("error");
+
+      if (audioEngineRef.current) {
+        audioEngineRef.current.dispose();
+        audioEngineRef.current = null;
+      }
     }
   }, [speakText, startTimer, stopTimer, updateStatus]);
+
+  // Retry recording upload
+  const retryUpload = useCallback(async () => {
+    if (!latestRecordingBlobRef.current) return;
+    const { blob, mimeType } = latestRecordingBlobRef.current;
+    setRecordingStatus("uploading");
+    setRecordingError(null);
+    try {
+      const publicUrl = await uploadRecording(blob, mimeType);
+      setRecordingUrl(publicUrl);
+      setRecordingStatus("uploaded");
+    } catch (err: unknown) {
+      console.error("[voice] Retry upload failed:", err);
+      setRecordingStatus("failed");
+      setRecordingError(
+        err instanceof Error ? err.message : "Upload failed"
+      );
+    }
+  }, []);
+
+  // Handle page unload to release mic hardware immediately
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (audioEngineRef.current) {
+        audioEngineRef.current.dispose();
+        audioEngineRef.current = null;
+      }
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+    };
+  }, []);
 
   // Clean up on unmount or navigate away
   useEffect(() => {
@@ -756,8 +1027,20 @@ export function useVoiceCall() {
       isHandlingTurnRef.current = false;
       stopTimer();
       if (abortControllerRef.current) abortControllerRef.current.abort();
+      if (currentTtsControllerRef.current) currentTtsControllerRef.current.abort();
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+
+      if (audioEngineRef.current) {
+        audioEngineRef.current.dispose();
+        audioEngineRef.current = null;
+      }
+
+      if (localRecordingUrlRef.current) {
+        URL.revokeObjectURL(localRecordingUrlRef.current);
+        localRecordingUrlRef.current = null;
+      }
+
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel();
       }
@@ -787,5 +1070,14 @@ export function useVoiceCall() {
     startCall,
     endCall,
     interrupt,
+    // Phase 5 additions
+    recording,
+    recordingStatus,
+    recordingUrl,
+    recordingError,
+    consentGiven,
+    consentTimestamp,
+    ttsFallbackUsed,
+    retryUpload,
   };
 }

@@ -3,6 +3,7 @@
 import React, { useRef, useState, useEffect } from "react";
 import { useVoiceCall, formatDuration, CallStatus } from "@/hooks/useVoiceCall";
 import CallIndicator from "@/components/CallIndicator";
+import { ConsentModal } from "@/components/ConsentModal";
 
 interface StatusDisplay {
   mainLabel: string;
@@ -47,8 +48,16 @@ export default function CallPage() {
     startCall,
     endCall,
     interrupt,
+    recording,
+    recordingStatus,
+    recordingUrl,
+    recordingError,
+    ttsFallbackUsed,
+    retryUpload,
   } = useVoiceCall();
 
+  const [isConsentModalOpen, setIsConsentModalOpen] = useState(false);
+  const [isStartingCall, setIsStartingCall] = useState(false);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
 
@@ -76,8 +85,27 @@ export default function CallPage() {
     }
   }, [messages, interimText, status, isUserScrolledUp]);
 
+  // Handle consent agree and start call in the same gesture
+  const handleAgreeConsent = async () => {
+    setIsStartingCall(true);
+    try {
+      setIsConsentModalOpen(false);
+      await startCall();
+    } finally {
+      setIsStartingCall(false);
+    }
+  };
+
   return (
     <div className="flex-1 flex flex-col justify-center py-4 sm:py-6 px-3 sm:px-6 lg:px-8 max-w-4xl w-full mx-auto">
+      {/* Consent Modal */}
+      <ConsentModal
+        isOpen={isConsentModalOpen}
+        onAgree={handleAgreeConsent}
+        onCancel={() => setIsConsentModalOpen(false)}
+        isStarting={isStartingCall}
+      />
+
       {/* Unsupported Browser Alert Banner */}
       {!isSupported && (
         <div className="mb-4 p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-sm flex items-center gap-3 shadow-xs">
@@ -136,6 +164,16 @@ export default function CallPage() {
         </div>
       )}
 
+      {/* Non-blocking TTS Fallback Warning */}
+      {ttsFallbackUsed && isCallActive && (
+        <div className="mb-3 px-3.5 py-2 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs flex items-center gap-2 shadow-2xs">
+          <span className="font-semibold">Notice:</span>
+          <span>
+            Voice service unavailable, using backup voice. The bot&apos;s voice may be missing from the recording.
+          </span>
+        </div>
+      )}
+
       {/* Main Card Container */}
       <div className="bg-white rounded-2xl border border-slate-200/90 shadow-sm overflow-hidden flex flex-col">
         {/* Header Area */}
@@ -169,6 +207,14 @@ export default function CallPage() {
                 </span>
               )}
             </div>
+
+            {/* Red Pulsing REC Badge during Active Call */}
+            {isCallActive && (
+              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-bold bg-rose-50 text-rose-600 border border-rose-200 shadow-2xs">
+                <span className="w-2 h-2 rounded-full bg-rose-600 animate-pulse" />
+                REC
+              </span>
+            )}
 
             {/* Tap to Interrupt Button (visible only while bot is speaking) */}
             {status === "speaking" && (
@@ -395,12 +441,149 @@ export default function CallPage() {
           </div>
         )}
 
+        {/* Call Recording Playback Card (Visible after Call Ends) */}
+        {status === "ended" && (recording || recordingError) && (
+          <div className="px-4 sm:px-6 py-4 bg-slate-50/90 border-t border-slate-200">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center flex-shrink-0">
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 100-6 3 3 0 000 6z"
+                    />
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900">
+                    Call Recording
+                  </h3>
+                  {recording && (
+                    <span className="text-[11px] text-slate-500">
+                      Duration: {formatDuration(Math.round(recording.durationMs / 1000))}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Status and Action Buttons */}
+              <div className="flex items-center gap-2">
+                {recordingStatus === "uploading" && (
+                  <span className="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-full border border-indigo-200">
+                    <svg
+                      className="animate-spin h-3.5 w-3.5 text-indigo-600"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                    >
+                      <circle
+                        className="opacity-25"
+                        cx="12"
+                        cy="12"
+                        r="10"
+                        stroke="currentColor"
+                        strokeWidth="4"
+                      />
+                      <path
+                        className="opacity-75"
+                        fill="currentColor"
+                        d="M4 12a8 8 0 018-8v8H4z"
+                      />
+                    </svg>
+                    Saving recording...
+                  </span>
+                )}
+                {recordingStatus === "uploaded" && (
+                  <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
+                    <svg
+                      className="w-3.5 h-3.5 text-emerald-600"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                    >
+                      <polyline points="20 6 9 17 4 12" />
+                    </svg>
+                    Recording saved
+                  </span>
+                )}
+                {recordingStatus === "failed" && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-amber-800 bg-amber-50 px-2.5 py-1 rounded-full border border-amber-200">
+                      Upload failed - playing local copy
+                    </span>
+                    <button
+                      type="button"
+                      onClick={retryUpload}
+                      className="px-2.5 py-1 text-xs font-semibold text-indigo-700 bg-white border border-indigo-200 rounded-lg hover:bg-indigo-50 shadow-2xs transition-colors"
+                    >
+                      Retry upload
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {recording ? (
+              <div className="space-y-2">
+                {/* HTML5 Audio Player */}
+                <audio
+                  controls
+                  src={recordingUrl || recording.localUrl}
+                  className="w-full h-10 rounded-lg"
+                  preload="metadata"
+                />
+
+                <div className="flex items-center justify-between text-xs text-slate-500 pt-1">
+                  <span>Format: {recording.mimeType.split(";")[0]}</span>
+                  <a
+                    href={recording.localUrl}
+                    download={recording.fileName}
+                    className="inline-flex items-center gap-1 font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
+                  >
+                    <svg
+                      className="w-3.5 h-3.5"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
+                      />
+                    </svg>
+                    Download
+                  </a>
+                </div>
+
+                {ttsFallbackUsed && (
+                  <p className="text-[11px] text-amber-700 bg-amber-50/60 p-2 rounded-lg border border-amber-200/60">
+                    Note: Some bot replies used the backup voice and are not in the recording.
+                  </p>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-slate-500 italic py-1">
+                {recordingError || "No recording available for this call."}
+              </p>
+            )}
+          </div>
+        )}
+
         {/* Action Buttons Area */}
         <div className="px-4 sm:px-6 py-4 border-t border-slate-200 bg-slate-50/60 flex flex-col sm:flex-row items-center justify-center gap-3 sm:gap-4">
           {/* Start / Start New Call Button */}
           <button
             type="button"
-            onClick={startCall}
+            onClick={() => setIsConsentModalOpen(true)}
             disabled={isCallActive || !isSupported}
             className={`w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center gap-2 px-6 py-2.5 rounded-xl font-semibold text-sm transition-all shadow-xs ${
               !isCallActive && isSupported
