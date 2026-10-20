@@ -50,7 +50,16 @@ export default function TestChatPage() {
   };
 
   useEffect(() => {
-    initGreeting(language);
+    let ignore = false;
+    const timer = setTimeout(() => {
+      if (!ignore) {
+        initGreeting(language);
+      }
+    }, 0);
+    return () => {
+      ignore = true;
+      clearTimeout(timer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
