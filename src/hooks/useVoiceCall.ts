@@ -58,6 +58,7 @@ export function useVoiceCall() {
   const isCallActiveRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const isRecognizingRef = useRef(false);
+  const isHandlingTurnRef = useRef(false);
 
   // Audio / Speech refs
   const recognitionRef = useRef<SpeechRecognition | null>(null);
@@ -163,6 +164,7 @@ export function useVoiceCall() {
     console.log("[voice] Ending voice call");
     isCallActiveRef.current = false;
     isSpeakingRef.current = false;
+    isHandlingTurnRef.current = false;
 
     // Abort in-flight network requests
     if (abortControllerRef.current) {
@@ -312,12 +314,17 @@ export function useVoiceCall() {
   // Send completed customer turn to LLM
   const handleUserTurn = useCallback(
     async (text: string) => {
-      if (!isCallActiveRef.current) return;
+      if (!isCallActiveRef.current || isHandlingTurnRef.current) return;
+      isHandlingTurnRef.current = true;
 
       console.log(`[voice] Final customer transcript: "${text}"`);
 
       // Immediately stop recognition during thinking
       stopRecognition();
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
       turnBufferRef.current = "";
       setInterimText("");
 
@@ -330,10 +337,12 @@ export function useVoiceCall() {
         content: text,
       };
 
-      const updatedHistory = [...messagesRef.current, userMsg];
-      messagesRef.current = updatedHistory;
-      setMessages(updatedHistory);
+      // Keep previous clean history for safe rollback on failure
+      const previousHistory = [...messagesRef.current];
+      const optimisticHistory = [...previousHistory, userMsg];
 
+      // Optimistically display the customer message in the UI
+      setMessages(optimisticHistory);
       updateStatus("thinking");
 
       // Abort previous in-flight requests if any
@@ -348,7 +357,7 @@ export function useVoiceCall() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            messages: updatedHistory.map((m) => ({
+            messages: optimisticHistory.map((m) => ({
               role: m.role,
               content: m.content,
             })),
@@ -357,11 +366,17 @@ export function useVoiceCall() {
           signal: abortControllerRef.current.signal,
         });
 
-        if (!isCallActiveRef.current) return;
+        if (!isCallActiveRef.current) {
+          isHandlingTurnRef.current = false;
+          return;
+        }
 
         const data = await res.json();
         if (!res.ok) {
-          throw new Error(data.error || "Failed to receive AI response.");
+          const apiErrorMsg =
+            data.error ||
+            `API error (${data.statusCode || res.status}): Failed to receive response`;
+          throw new Error(apiErrorMsg);
         }
 
         const reply = data.reply as string;
@@ -376,13 +391,19 @@ export function useVoiceCall() {
           content: reply,
         };
 
-        const finalHistory = [...messagesRef.current, assistantMsg];
-        messagesRef.current = finalHistory;
-        setMessages(finalHistory);
+        // Commit both user message and assistant reply to official history
+        const confirmedHistory = [...previousHistory, userMsg, assistantMsg];
+        messagesRef.current = confirmedHistory;
+        setMessages(confirmedHistory);
+
+        // Clear any previous error banner on successful reply
+        setError(null);
+        isHandlingTurnRef.current = false;
 
         // Speak the reply
         speakText(reply);
       } catch (err: unknown) {
+        isHandlingTurnRef.current = false;
         if (!isCallActiveRef.current) return;
 
         if (err instanceof DOMException && err.name === "AbortError") {
@@ -395,9 +416,15 @@ export function useVoiceCall() {
           err instanceof Error
             ? err.message
             : "Connection error with AI service.";
+
+        // Roll back messages so the failed customer message does not remain or duplicate
+        messagesRef.current = previousHistory;
+        setMessages(previousHistory);
+
+        // Show real error text in the error banner
         setError(errMsg);
 
-        // Friendly fallback line so conversation never freezes
+        // Speak fallback line once per failure (does not loop)
         const fallbackText =
           languageRef.current === "hi"
             ? "माफ़ कीजिये, कनेक्शन में समस्या आई। क्या आप दोबारा कह सकते हैं?"
@@ -581,6 +608,7 @@ export function useVoiceCall() {
     console.log("[voice] Starting voice call...");
     isCallActiveRef.current = true;
     isSpeakingRef.current = false;
+    isHandlingTurnRef.current = false;
     messagesRef.current = [];
     setMessages([]);
     setInterimText("");
@@ -607,7 +635,10 @@ export function useVoiceCall() {
 
       const data = await res.json();
       if (!res.ok) {
-        throw new Error(data.error || "Failed to start call with AI agent.");
+        const apiErrorMsg =
+          data.error ||
+          `API error (${data.statusCode || res.status}): Failed to start call with AI agent.`;
+        throw new Error(apiErrorMsg);
       }
 
       const greeting = data.reply as string;
@@ -648,6 +679,7 @@ export function useVoiceCall() {
   useEffect(() => {
     return () => {
       isCallActiveRef.current = false;
+      isHandlingTurnRef.current = false;
       if (abortControllerRef.current) abortControllerRef.current.abort();
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);

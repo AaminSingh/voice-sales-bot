@@ -22,13 +22,14 @@ function stripMarkdown(text: string): string {
 }
 
 export async function POST(req: Request) {
+  let apiKey: string | undefined;
   try {
     let body: ChatRequestBody;
     try {
       body = await req.json();
     } catch {
       return NextResponse.json(
-        { error: "Invalid JSON in request body." },
+        { error: "Invalid JSON in request body.", statusCode: 400 },
         { status: 400 }
       );
     }
@@ -38,7 +39,7 @@ export async function POST(req: Request) {
     // Validate language
     if (language !== "en" && language !== "hi") {
       return NextResponse.json(
-        { error: "Invalid language. Allowed values are 'en' or 'hi'." },
+        { error: "Invalid language. Allowed values are 'en' or 'hi'.", statusCode: 400 },
         { status: 400 }
       );
     }
@@ -46,7 +47,7 @@ export async function POST(req: Request) {
     // Validate messages is an array
     if (!Array.isArray(messages)) {
       return NextResponse.json(
-        { error: "The 'messages' field must be an array." },
+        { error: "The 'messages' field must be an array.", statusCode: 400 },
         { status: 400 }
       );
     }
@@ -56,7 +57,7 @@ export async function POST(req: Request) {
       const msg = messages[i];
       if (!msg || typeof msg !== "object") {
         return NextResponse.json(
-          { error: `Message at index ${i} is not a valid object.` },
+          { error: `Message at index ${i} is not a valid object.`, statusCode: 400 },
           { status: 400 }
         );
       }
@@ -64,13 +65,14 @@ export async function POST(req: Request) {
         return NextResponse.json(
           {
             error: `Invalid role at index ${i}. Allowed roles are 'user' or 'assistant'.`,
+            statusCode: 400,
           },
           { status: 400 }
         );
       }
       if (typeof msg.content !== "string") {
         return NextResponse.json(
-          { error: `Message content at index ${i} must be a string.` },
+          { error: `Message content at index ${i} must be a string.`, statusCode: 400 },
           { status: 400 }
         );
       }
@@ -78,6 +80,7 @@ export async function POST(req: Request) {
         return NextResponse.json(
           {
             error: `Message content at index ${i} exceeds maximum limit of 1000 characters.`,
+            statusCode: 400,
           },
           { status: 400 }
         );
@@ -85,53 +88,62 @@ export async function POST(req: Request) {
     }
 
     // Check API key (server-side only, never logged or leaked)
-    const apiKey = process.env.GEMINI_API_KEY?.trim();
+    apiKey = process.env.GEMINI_API_KEY?.trim();
     if (!apiKey) {
       console.error("Gemini API key is missing in environment variables.");
       return NextResponse.json(
         {
           error:
             "Gemini API key is not configured on the server. Please add GEMINI_API_KEY to your .env.local file.",
+          statusCode: 500,
         },
         { status: 500 }
       );
     }
 
-    const modelName = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
+    const requestedModel = process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
 
     // Keep only the last 20 messages to keep requests small
     const recentMessages = messages.slice(-20);
 
-    // Map messages to Gemini format (role 'user' or 'model')
-    const geminiContents: { role: "user" | "model"; parts: { text: string }[] }[] = [];
+    // Raw Gemini turns: must begin with a user turn
+    const rawTurns: { role: "user" | "model"; content: string }[] = [];
 
     if (recentMessages.length === 0) {
       // Empty messages: call just connected, trigger bot opening greeting
-      geminiContents.push({
+      rawTurns.push({
         role: "user",
-        parts: [
-          {
-            text: "[The call has just connected. Greet the customer and introduce yourself.]",
-          },
-        ],
+        content: "[The call has just connected. Greet the customer and introduce yourself.]",
       });
     } else {
-      // Gemini requires conversation to begin with a 'user' turn
+      // If the conversation starts with an assistant message (e.g. the greeting),
+      // Gemini requires the conversation to start with a user turn. Always prepend.
       if (recentMessages[0].role === "assistant") {
-        geminiContents.push({
+        rawTurns.push({
           role: "user",
-          parts: [
-            {
-              text: "[The call has just connected. Greet the customer and introduce yourself.]",
-            },
-          ],
+          content: "[The call has just connected. Greet the customer and introduce yourself.]",
         });
       }
 
       for (const m of recentMessages) {
-        geminiContents.push({
+        rawTurns.push({
           role: m.role === "assistant" ? "model" : "user",
-          parts: [{ text: m.content }],
+          content: m.content,
+        });
+      }
+    }
+
+    // Merge consecutive messages with the same role into one so roles strictly alternate user/model
+    const geminiContents: { role: "user" | "model"; parts: { text: string }[] }[] = [];
+    for (const turn of rawTurns) {
+      const last = geminiContents[geminiContents.length - 1];
+      if (last && last.role === turn.role) {
+        const combined = `${last.parts[0]?.text || ""} ${turn.content}`.trim();
+        last.parts = [{ text: combined }];
+      } else {
+        geminiContents.push({
+          role: turn.role,
+          parts: [{ text: turn.content.trim() }],
         });
       }
     }
@@ -139,31 +151,18 @@ export async function POST(req: Request) {
     const ai = new GoogleGenAI({ apiKey });
     const systemPrompt = buildSystemPrompt(language);
 
+    // Candidate models to attempt sequentially in case of 404 (model retirement) or 503 (high demand)
+    const candidateModels = Array.from(
+      new Set([requestedModel, "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.8-flash"])
+    );
+
     let response;
-    try {
-      response = await ai.models.generateContent({
-        model: modelName,
-        contents: geminiContents,
-        config: {
-          systemInstruction: systemPrompt,
-          temperature: 0.7,
-          maxOutputTokens: 150,
-          thinkingConfig: {
-            thinkingBudget: 0,
-          },
-        },
-      });
-    } catch (modelErr: unknown) {
-      const errMsg = modelErr instanceof Error ? modelErr.message : String(modelErr);
-      // Gracefully handle model retirement/fallback (e.g., gemini-2.5-flash deprecated in favor of gemini-3.8-flash)
-      if (
-        errMsg.includes("no longer available") ||
-        errMsg.includes("404") ||
-        errMsg.includes("NOT_FOUND")
-      ) {
-        console.warn(`Model ${modelName} unavailable, falling back to gemini-3.8-flash`);
+    let lastError: unknown;
+
+    for (const model of candidateModels) {
+      try {
         response = await ai.models.generateContent({
-          model: "gemini-3.8-flash",
+          model,
           contents: geminiContents,
           config: {
             systemInstruction: systemPrompt,
@@ -174,20 +173,57 @@ export async function POST(req: Request) {
             },
           },
         });
-      } else {
-        throw modelErr;
+        if (response) {
+          break;
+        }
+      } catch (modelErr: unknown) {
+        lastError = modelErr;
+        const errMsg = modelErr instanceof Error ? modelErr.message : String(modelErr);
+        console.warn(`[api/chat] Model ${model} unavailable (${errMsg.slice(0, 100)}), trying next candidate...`);
       }
+    }
+
+    if (!response) {
+      throw lastError;
     }
 
     const reply = stripMarkdown(response.text || "");
 
     return NextResponse.json({ reply });
   } catch (err: unknown) {
-    // Log server error without exposing secrets
-    console.error("Error during Gemini chat API execution:", err);
+    let statusCode = 500;
+    let errorMessage = "An unexpected error occurred while communicating with the AI.";
 
-    const errorMessage = err instanceof Error ? err.message : String(err);
+    if (err && typeof err === "object") {
+      const anyErr = err as Record<string, unknown>;
+      if (typeof anyErr.status === "number") {
+        statusCode = anyErr.status;
+      } else if (typeof anyErr.statusCode === "number") {
+        statusCode = anyErr.statusCode;
+      } else if (anyErr.error && typeof anyErr.error === "object") {
+        const nested = anyErr.error as Record<string, unknown>;
+        if (typeof nested.code === "number") {
+          statusCode = nested.code;
+        }
+      }
+
+      if (typeof anyErr.message === "string") {
+        errorMessage = anyErr.message;
+      }
+    } else if (typeof err === "string") {
+      errorMessage = err;
+    }
+
+    // Redact API key if it appears anywhere in error message
+    if (apiKey) {
+      errorMessage = errorMessage.replaceAll(apiKey, "[REDACTED_API_KEY]");
+    }
+
+    // Log the real Gemini error including status code and message (never the API key)
+    console.error(`[api/chat] Real Gemini Error (Status ${statusCode}): ${errorMessage}`);
+
     const isRateLimit =
+      statusCode === 429 ||
       errorMessage.includes("429") ||
       errorMessage.includes("RESOURCE_EXHAUSTED") ||
       errorMessage.toLowerCase().includes("quota") ||
@@ -195,17 +231,21 @@ export async function POST(req: Request) {
 
     if (isRateLimit) {
       return NextResponse.json(
-        { error: "The AI is busy, please try again." },
+        {
+          error: "The AI is busy, please try again.",
+          statusCode: 429,
+          details: errorMessage,
+        },
         { status: 429 }
       );
     }
 
     return NextResponse.json(
       {
-        error:
-          "An unexpected error occurred while communicating with the AI. Please try again.",
+        error: errorMessage,
+        statusCode: statusCode,
       },
-      { status: 500 }
+      { status: statusCode >= 400 && statusCode < 600 ? statusCode : 500 }
     );
   }
 }
