@@ -3,7 +3,8 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 
 // Tunable delay (in milliseconds) of silence before treating customer speech as a completed turn
-export const SILENCE_DELAY_MS = 1200;
+export const END_OF_TURN_SILENCE_MS = 1800;
+export const SILENCE_DELAY_MS = END_OF_TURN_SILENCE_MS;
 
 // Minimum transcript characters required to qualify as customer speech
 const MIN_TRANSCRIPT_LENGTH = 2;
@@ -24,6 +25,30 @@ export interface CallMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  timestamp: string;
+}
+
+function getCurrentTimestamp(): string {
+  const now = new Date();
+  return now.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+export function formatDuration(seconds: number): string {
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+
+  const mm = String(mins).padStart(2, "0");
+  const ss = String(secs).padStart(2, "0");
+
+  if (hrs > 0) {
+    return `${hrs}:${mm}:${ss}`;
+  }
+  return `${mm}:${ss}`;
 }
 
 function splitIntoSentences(text: string): string[] {
@@ -40,6 +65,7 @@ export function useVoiceCall() {
   const [language, setLanguageState] = useState<"en" | "hi">("en");
   const [headphonesMode, setHeadphonesModeState] = useState(false);
   const [voiceWarning, setVoiceWarning] = useState<string | null>(null);
+  const [durationSeconds, setDurationSeconds] = useState(0);
 
   // Lazy initializer to avoid setting state synchronously inside an effect
   const [isSupported] = useState<boolean>(() => {
@@ -59,6 +85,10 @@ export function useVoiceCall() {
   const isSpeakingRef = useRef(false);
   const isRecognizingRef = useRef(false);
   const isHandlingTurnRef = useRef(false);
+
+  // Timer refs
+  const callStartTimeRef = useRef<number | null>(null);
+  const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Audio / Speech refs
   const recognitionRef = useRef<SpeechRecognition | null>(null);
@@ -90,6 +120,34 @@ export function useVoiceCall() {
     headphonesModeRef.current = val;
     setHeadphonesModeState(val);
   }, []);
+
+  // Stop timer and record final duration
+  const stopTimer = useCallback(() => {
+    if (timerIntervalRef.current) {
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
+    }
+    if (callStartTimeRef.current) {
+      const elapsedMs = Date.now() - callStartTimeRef.current;
+      setDurationSeconds(Math.floor(elapsedMs / 1000));
+    }
+    console.log("[voice] Call timer stopped");
+  }, []);
+
+  // Start timer computing elapsed time from Date.now()
+  const startTimer = useCallback(() => {
+    stopTimer();
+    callStartTimeRef.current = Date.now();
+    setDurationSeconds(0);
+    console.log("[voice] Call timer started");
+
+    timerIntervalRef.current = setInterval(() => {
+      if (callStartTimeRef.current) {
+        const elapsedMs = Date.now() - callStartTimeRef.current;
+        setDurationSeconds(Math.floor(elapsedMs / 1000));
+      }
+    }, 1000);
+  }, [stopTimer]);
 
   // Check Hindi voice availability
   const checkVoices = useCallback((voices: SpeechSynthesisVoice[]) => {
@@ -166,6 +224,9 @@ export function useVoiceCall() {
     isSpeakingRef.current = false;
     isHandlingTurnRef.current = false;
 
+    // Stop timer and retain final duration
+    stopTimer();
+
     // Abort in-flight network requests
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -193,7 +254,7 @@ export function useVoiceCall() {
 
     updateStatus("ended");
     setInterimText("");
-  }, [stopRecognition, updateStatus]);
+  }, [stopRecognition, stopTimer, updateStatus]);
 
   // Start speech recognition with state guards
   const startRecognition = useCallback(() => {
@@ -335,6 +396,7 @@ export function useVoiceCall() {
             : String(Date.now()),
         role: "user",
         content: text,
+        timestamp: getCurrentTimestamp(),
       };
 
       // Keep previous clean history for safe rollback on failure
@@ -389,6 +451,7 @@ export function useVoiceCall() {
               : String(Date.now()),
           role: "assistant",
           content: reply,
+          timestamp: getCurrentTimestamp(),
         };
 
         // Commit both user message and assistant reply to official history
@@ -417,6 +480,9 @@ export function useVoiceCall() {
             ? err.message
             : "Connection error with AI service.";
 
+        // Stop timer on critical error
+        stopTimer();
+
         // Roll back messages so the failed customer message does not remain or duplicate
         messagesRef.current = previousHistory;
         setMessages(previousHistory);
@@ -433,7 +499,7 @@ export function useVoiceCall() {
         speakText(fallbackText);
       }
     },
-    [speakText, stopRecognition, updateStatus]
+    [speakText, stopRecognition, stopTimer, updateStatus]
   );
 
   // Initialize SpeechSynthesis voices
@@ -505,7 +571,7 @@ export function useVoiceCall() {
         interrupt();
       }
 
-      // Reset silence detection timer
+      // Reset silence detection timer (1800ms)
       if (silenceTimerRef.current) {
         clearTimeout(silenceTimerRef.current);
       }
@@ -524,7 +590,7 @@ export function useVoiceCall() {
           if (finishedTurn.length >= MIN_TRANSCRIPT_LENGTH) {
             handleUserTurn(finishedTurn);
           }
-        }, SILENCE_DELAY_MS);
+        }, END_OF_TURN_SILENCE_MS);
       }
     };
 
@@ -614,6 +680,9 @@ export function useVoiceCall() {
     setInterimText("");
     turnBufferRef.current = "";
     setError(null);
+    setDurationSeconds(0);
+    callStartTimeRef.current = null;
+    stopTimer();
     updateStatus("connecting");
 
     // Abort previous controller if any
@@ -651,10 +720,14 @@ export function useVoiceCall() {
             : String(Date.now()),
         role: "assistant",
         content: greeting,
+        timestamp: getCurrentTimestamp(),
       };
 
       messagesRef.current = [greetingMsg];
       setMessages([greetingMsg]);
+
+      // Timer starts when the call becomes "live" (greeting begins speaking)
+      startTimer();
 
       // Speak opening greeting (onend will transition to listening)
       speakText(greeting);
@@ -670,16 +743,18 @@ export function useVoiceCall() {
         err instanceof Error
           ? err.message
           : "Could not connect to the sales agent.";
+      stopTimer();
       setError(errMsg);
       updateStatus("error");
     }
-  }, [speakText, updateStatus]);
+  }, [speakText, startTimer, stopTimer, updateStatus]);
 
   // Clean up on unmount or navigate away
   useEffect(() => {
     return () => {
       isCallActiveRef.current = false;
       isHandlingTurnRef.current = false;
+      stopTimer();
       if (abortControllerRef.current) abortControllerRef.current.abort();
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
@@ -694,12 +769,13 @@ export function useVoiceCall() {
         }
       }
     };
-  }, []);
+  }, [stopTimer]);
 
   return {
     status,
     messages,
     interimText,
+    durationSeconds,
     error,
     clearError: () => setError(null),
     isSupported,
